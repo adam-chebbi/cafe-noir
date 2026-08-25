@@ -1,0 +1,6 @@
+{
+  "name": "Café Noir",
+  "description": "A moody, elegant, editorial-style website for boutique coffee shop Café Noir, featuring a single-page showcase, dedicated /menu tasting page with animations, dark charcoal palette, warm beige environment section, sage accents, and high-contrast serif typography.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
