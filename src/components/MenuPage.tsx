@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Search,
@@ -15,9 +15,11 @@ import {
   RefreshCw,
   Info,
   CheckCircle2,
+  Timer,
+  QrCode
 } from 'lucide-react';
 import { ApiMenuItem, WebCartItem, OrderSubmitResponse, SelectedOption, CustomizationOptions, MenuItem } from '../types';
-import { fetchPublicMenu } from '../services/api';
+import { fetchPublicMenu, initQRSession, validateQRSession } from '../services/api';
 import { CustomizeModal } from './CustomizeModal';
 import { CartDrawer } from './CartDrawer';
 import { OrderSuccessModal } from './OrderSuccessModal';
@@ -30,7 +32,7 @@ interface MenuPageProps {
 
 export const MenuPage: React.FC<MenuPageProps> = ({
   tableNumber,
-  tableToken,
+  tableToken: initialTableToken,
   onNavigateHome,
 }) => {
   const [products, setProducts] = useState<ApiMenuItem[]>([]);
@@ -51,6 +53,15 @@ export const MenuPage: React.FC<MenuPageProps> = ({
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedTag, setSelectedTag] = useState<string | 'all'>('all');
+
+  // QR Session Security State (Blueprint Part A)
+  const [activeTableToken, setActiveTableToken] = useState<string | undefined>(initialTableToken);
+  const [sessionExpiresAt, setSessionExpiresAt] = useState<string | null>(null);
+  const [remainingSeconds, setRemainingSeconds] = useState<number>(0);
+  const [isOrderingAllowed, setIsOrderingAllowed] = useState<boolean>(false);
+  const [isSessionExpired, setIsSessionExpired] = useState<boolean>(false);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [sessionInitializing, setSessionInitializing] = useState<boolean>(false);
 
   // Modals state
   const [customizingItem, setCustomizingItem] = useState<ApiMenuItem | null>(null);
@@ -83,13 +94,107 @@ export const MenuPage: React.FC<MenuPageProps> = ({
     }
   };
 
+  // Initialize or Validate QR Session with Backend (Part A.3 & A.5)
+  const bootstrapQRSession = async () => {
+    if (!tableNumber) {
+      setIsOrderingAllowed(false);
+      setIsSessionExpired(false);
+      return;
+    }
+
+    setSessionInitializing(true);
+    setSessionError(null);
+    try {
+      const session = await initQRSession(tableNumber, activeTableToken);
+      if (session.valid && session.token && session.expiresAt) {
+        setActiveTableToken(session.token);
+        setSessionExpiresAt(session.expiresAt);
+        const rem = Math.max(0, Math.floor((new Date(session.expiresAt).getTime() - Date.now()) / 1000));
+        setRemainingSeconds(rem);
+        if (rem > 0) {
+          setIsOrderingAllowed(true);
+          setIsSessionExpired(false);
+        } else {
+          setIsOrderingAllowed(false);
+          setIsSessionExpired(true);
+        }
+      } else {
+        setIsOrderingAllowed(false);
+        setIsSessionExpired(true);
+        setSessionError("Session de commande non valide ou expirée.");
+      }
+    } catch (err: any) {
+      console.warn("Could not initialize QR session:", err);
+      setIsOrderingAllowed(false);
+      setSessionError(err.message || "Impossible de démarrer la session de commande.");
+    } finally {
+      setSessionInitializing(false);
+    }
+  };
+
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: 'instant' });
     loadMenuData();
-  }, []);
+    if (tableNumber) {
+      bootstrapQRSession();
+    }
+  }, [tableNumber]);
+
+  // Real-time Countdown Timer driven by server expires_at timestamp (Part A.6)
+  useEffect(() => {
+    if (!sessionExpiresAt || !isOrderingAllowed) return;
+
+    const interval = setInterval(() => {
+      const diff = Math.max(0, Math.floor((new Date(sessionExpiresAt).getTime() - Date.now()) / 1000));
+      setRemainingSeconds(diff);
+
+      if (diff <= 0) {
+        // Expiry reached
+        setIsOrderingAllowed(false);
+        setIsSessionExpired(true);
+        setCartItems([]);
+        setIsCartOpen(false);
+        clearInterval(interval);
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [sessionExpiresAt, isOrderingAllowed]);
+
+  // Re-validate session when window regains focus (Part A.6)
+  useEffect(() => {
+    if (!tableNumber || !activeTableToken) return;
+
+    const handleFocus = async () => {
+      if (sessionExpiresAt && new Date(sessionExpiresAt).getTime() > Date.now()) {
+        try {
+          const res = await validateQRSession(tableNumber, activeTableToken);
+          if (!res.valid) {
+            setIsOrderingAllowed(false);
+            setIsSessionExpired(true);
+            setCartItems([]);
+            setIsCartOpen(false);
+          } else if (res.expiresAt) {
+            setSessionExpiresAt(res.expiresAt);
+          }
+        } catch (e) {
+          console.warn("Session focus re-validation check failed", e);
+        }
+      }
+    };
+
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, [tableNumber, activeTableToken, sessionExpiresAt]);
 
   const formatDT = (amount: number) => {
     return `${amount.toFixed(3)} DT`;
+  };
+
+  const formatCountdown = (totalSec: number) => {
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
   // Derive categories with counts
@@ -104,7 +209,6 @@ export const MenuPage: React.FC<MenuPageProps> = ({
         list.push({ id: c.name, label: c.name, count });
       });
     } else {
-      // Group by distinct categories in products
       const distinct: string[] = Array.from(new Set(products.map((p) => p.category)));
       distinct.forEach((catName) => {
         const count = products.filter((p) => p.category === catName).length;
@@ -153,7 +257,7 @@ export const MenuPage: React.FC<MenuPageProps> = ({
     });
   }, [products, selectedCategory, selectedTag, searchQuery]);
 
-  // Cart operations
+  // Cart operations (Only functional when isOrderingAllowed === true)
   const handleAddToCart = (
     item: MenuItem,
     _customization: CustomizationOptions,
@@ -161,6 +265,8 @@ export const MenuPage: React.FC<MenuPageProps> = ({
     selectedOptions: SelectedOption[],
     customerNote?: string
   ) => {
+    if (!isOrderingAllowed) return;
+
     const apiItem = products.find((p) => p.id === item.id) || (item as unknown as ApiMenuItem);
     const optionsDelta = selectedOptions.reduce((sum, opt) => sum + opt.priceDelta, 0);
     const unitPrice = apiItem.price + optionsDelta;
@@ -181,6 +287,7 @@ export const MenuPage: React.FC<MenuPageProps> = ({
   };
 
   const handleUpdateQuantity = (cartItemId: string, newQuantity: number) => {
+    if (!isOrderingAllowed) return;
     setCartItems((prev) =>
       prev.map((i) => (i.cartItemId === cartItemId ? { ...i, quantity: newQuantity } : i))
     );
@@ -203,8 +310,8 @@ export const MenuPage: React.FC<MenuPageProps> = ({
     }
   };
 
-  const totalCartCount = cartItems.reduce((acc, i) => acc + i.quantity, 0);
-  const cartSubtotal = cartItems.reduce((acc, i) => acc + i.unitPrice * i.quantity, 0);
+  const totalCartCount = isOrderingAllowed ? cartItems.reduce((acc, i) => acc + i.quantity, 0) : 0;
+  const cartSubtotal = isOrderingAllowed ? cartItems.reduce((acc, i) => acc + i.unitPrice * i.quantity, 0) : 0;
 
   return (
     <div className="min-h-screen bg-[#0E0E0E] text-[#F5F5F0] selection:bg-[#8FC1A6] selection:text-[#0E0E0E] font-sans pb-28">
@@ -243,10 +350,11 @@ export const MenuPage: React.FC<MenuPageProps> = ({
               <span>{establishmentInfo.openingHours}</span>
             </div>
 
-            {totalCartCount > 0 && (
+            {/* Cart Icon rendered ONLY when ordering is active (Part A.7) */}
+            {isOrderingAllowed && totalCartCount > 0 && (
               <button
                 onClick={() => setIsCartOpen(true)}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[#8FC1A6] text-[#0E0E0E] font-bold text-xs shadow-lg hover:bg-[#9ED4B5] transition-all cursor-pointer"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[#8FC1A6] text-[#0E0E0E] font-bold text-xs shadow-lg hover:bg-[#9ED4B5] transition-all cursor-pointer animate-in fade-in"
               >
                 <ShoppingBag className="w-3.5 h-3.5" />
                 <span>{totalCartCount}</span>
@@ -256,26 +364,68 @@ export const MenuPage: React.FC<MenuPageProps> = ({
         </div>
       </header>
 
-      {/* Table Information Banner */}
+      {/* QR Table Session Banner (Live Countdown & Strict Gating - Part A.6 & A.7) */}
       {tableNumber && (
-        <div className="bg-gradient-to-r from-[#17261E] via-[#141F1A] to-[#121211] border-b border-[#8FC1A6]/30 px-4 sm:px-8 py-3">
-          <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
-            <div className="flex items-center gap-2.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#8FC1A6] animate-ping" />
-              <span className="text-[#D4E8DC] font-medium">
-                Vous commandez pour : <strong className="text-white uppercase tracking-wider">{tableNumber}</strong>
+        <div className={`border-b transition-colors px-4 sm:px-8 py-3.5 ${
+          isOrderingAllowed 
+            ? 'bg-gradient-to-r from-[#17261E] via-[#141F1A] to-[#121211] border-[#8FC1A6]/40' 
+            : isSessionExpired 
+              ? 'bg-gradient-to-r from-[#2A1414] via-[#1F1212] to-[#141212] border-rose-900/60'
+              : 'bg-[#181816] border-[#262624]'
+        }`}>
+          <div className="max-w-7xl mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+            {/* Left: Table Identifier */}
+            <div className="flex items-center gap-3">
+              <span className={`w-2.5 h-2.5 rounded-full ${
+                isOrderingAllowed 
+                  ? 'bg-[#8FC1A6] animate-ping' 
+                  : isSessionExpired 
+                    ? 'bg-rose-500' 
+                    : 'bg-amber-400 animate-pulse'
+              }`} />
+              <span className="text-[#D4E8DC] font-medium text-xs sm:text-sm">
+                Vous commandez pour : <strong className="text-white uppercase tracking-wider font-bold">{tableNumber}</strong>
               </span>
             </div>
-            <span className="text-[#8FC1A6] text-[11px] font-medium">
-              Vos boissons et plats seront servis directement à votre table • Règlement en salle
-            </span>
+
+            {/* Right: Live Countdown or Expiry Action */}
+            <div className="flex items-center gap-3">
+              {isOrderingAllowed ? (
+                <div className="flex items-center gap-2 bg-[#0E0E0E]/60 border border-[#8FC1A6]/30 px-3 py-1.5 rounded-full shadow-inner">
+                  <Timer className="w-3.5 h-3.5 text-[#8FC1A6] animate-pulse" />
+                  <span className="text-[#A6A69F] text-[11px] font-medium">Session valide :</span>
+                  <span className="font-mono text-xs font-bold text-white tracking-wider">
+                    {formatCountdown(remainingSeconds)}
+                  </span>
+                </div>
+              ) : isSessionExpired ? (
+                <div className="flex items-center gap-2">
+                  <span className="text-rose-300 text-xs font-medium flex items-center gap-1.5">
+                    <AlertCircle className="w-3.5 h-3.5 text-rose-400" />
+                    Session de commande expirée
+                  </span>
+                  <button
+                    onClick={bootstrapQRSession}
+                    disabled={sessionInitializing}
+                    className="flex items-center gap-1.5 px-3 py-1 bg-rose-900/80 hover:bg-rose-800 text-white rounded-full text-[11px] font-semibold transition-all cursor-pointer shadow"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${sessionInitializing ? 'animate-spin' : ''}`} />
+                    <span>Rescanner / Rafraîchir</span>
+                  </button>
+                </div>
+              ) : (
+                <span className="text-[#A6A69F] text-xs flex items-center gap-1.5">
+                  <RefreshCw className="w-3 h-3 animate-spin text-[#8FC1A6]" />
+                  Initialisation sécurisée...
+                </span>
+              )}
+            </div>
           </div>
         </div>
       )}
 
       {/* Hero Banner Section */}
-      <section className="relative w-full pt-8 pb-6 sm:pt-14 sm:pb-10 md:pt-16 md:pb-12 px-4 sm:px-8 md:px-16 lg:px-24 border-b border-[#1A1A18] overflow-hidden">
-        {/* Subtle ambient gradients */}
+      <section className="relative w-full pt-8 pb-6 sm:pt-12 sm:pb-8 px-4 sm:px-8 md:px-16 lg:px-24 border-b border-[#1A1A18] overflow-hidden">
         <div className="absolute top-0 right-1/4 w-72 sm:w-96 h-72 sm:h-96 bg-[#8FC1A6]/5 rounded-full blur-3xl pointer-events-none" />
         <div className="absolute -bottom-10 left-10 w-60 sm:w-80 h-60 sm:h-80 bg-[#E9E2D6]/5 rounded-full blur-3xl pointer-events-none" />
 
@@ -301,150 +451,110 @@ export const MenuPage: React.FC<MenuPageProps> = ({
           </motion.h1>
 
           <motion.p
-            initial={{ opacity: 0, y: 16 }}
+            initial={{ opacity: 0, y: 15 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.6, delay: 0.2 }}
-            className="font-sans text-xs sm:text-sm text-[#B8B8B0] font-light max-w-2xl mx-auto leading-relaxed"
+            className="text-xs sm:text-sm md:text-base text-[#B8B8B0] max-w-2xl mx-auto font-light leading-relaxed mb-6 sm:mb-8"
           >
-            Cafés de spécialité, extractions douces, thés raffinés et douceurs artisanales préparées chaque matin à Tunis.
+            {isOrderingAllowed 
+              ? `Sélectionnez vos boissons et gourmandises, personnalisez vos options et envoyez directement votre commande pour la ${tableNumber}.`
+              : `Découvrez nos sélections de cafés d'exception, thés et créations gourmandes. Pour commander, veuillez scanner le QR code sur votre table.`}
           </motion.p>
-        </div>
-      </section>
 
-      {/* Main Filter & Navigation Bar */}
-      <section className="sticky top-[57px] sm:top-[65px] z-30 bg-[#0E0E0E]/95 backdrop-blur-xl border-b border-[#1E1E1C] px-4 sm:px-8 md:px-16 lg:px-24 py-3 shadow-lg">
-        <div className="max-w-7xl mx-auto space-y-2.5">
-          {/* Top Row: Search Input & Tag Filter Chips */}
-          <div className="flex flex-col md:flex-row items-stretch md:items-center gap-2 sm:gap-3">
-            {/* Search Input */}
-            <div className="relative flex-1">
-              <Search className="w-4 h-4 text-[#8FC1A6] absolute left-3.5 top-1/2 -translate-y-1/2" />
+          {/* Search Bar & Quick Filters */}
+          <div className="max-w-2xl mx-auto space-y-3">
+            <div className="relative">
+              <Search className="w-4 h-4 text-[#7A7A72] absolute left-4 top-1/2 -translate-y-1/2" />
               <input
-                id="menu-search-input"
                 type="text"
+                placeholder="Rechercher un café, une boisson, une pâtisserie..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Rechercher (ex: Espresso, Cappucin, Thé aux pignons, Croissant)..."
-                className="w-full pl-10 pr-10 py-2 rounded-xl bg-[#161614] border border-[#262624] text-xs sm:text-sm text-[#F5F5F0] placeholder:text-[#6C6C66] focus:outline-none focus:border-[#8FC1A6] transition-colors"
+                className="w-full pl-11 pr-10 py-3 bg-[#161614] border border-[#262624] focus:border-[#8FC1A6] rounded-2xl text-xs sm:text-sm text-white placeholder:text-[#666660] focus:outline-none transition-all shadow-inner"
               />
               {searchQuery && (
                 <button
                   onClick={() => setSearchQuery('')}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-[#8FC1A6] hover:text-white p-1 cursor-pointer"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-[#7A7A72] hover:text-white p-1"
                 >
-                  <X className="w-3.5 h-3.5" />
+                  <X className="w-4 h-4" />
                 </button>
               )}
             </div>
 
-            {/* Quick Tag Pills */}
-            <div className="flex items-center gap-1.5 overflow-x-auto pb-1 md:pb-0 scrollbar-none">
-              <span className="text-[10px] sm:text-[11px] tracking-wider uppercase text-[#8FC1A6] font-medium whitespace-nowrap mr-1 flex items-center gap-1 shrink-0">
-                <SlidersHorizontal className="w-3 h-3" /> Filtre :
-              </span>
-              {quickTags.map((tag) => {
-                const active = selectedTag === tag.id;
-                return (
-                  <button
-                    key={tag.id}
-                    onClick={() => setSelectedTag(active ? 'all' : tag.id)}
-                    className={`text-[11px] sm:text-xs px-2.5 sm:px-3 py-1 rounded-lg font-medium whitespace-nowrap transition-all cursor-pointer shrink-0 ${
-                      active
-                        ? 'bg-[#8FC1A6] text-[#0E0E0E] font-semibold shadow-sm'
-                        : 'bg-[#181816] text-[#A6A69F] hover:bg-[#222220] hover:text-white border border-[#242422]'
-                    }`}
-                  >
-                    {tag.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Category Tabs */}
-          <div className="flex items-center gap-2 overflow-x-auto pt-1 pb-1 scrollbar-none border-t border-[#1A1A18]">
-            {categories.map((cat) => {
-              const active = selectedCategory === cat.id;
-              return (
+            {/* Quick Tags */}
+            <div className="flex flex-wrap items-center justify-center gap-1.5 sm:gap-2 pt-1">
+              {quickTags.map((tag) => (
                 <button
-                  key={cat.id}
-                  onClick={() => setSelectedCategory(cat.id)}
-                  className={`relative flex items-center gap-2 px-3.5 sm:px-4 py-1.5 rounded-xl text-xs transition-all whitespace-nowrap cursor-pointer shrink-0 ${
-                    active
-                      ? 'bg-[#8FC1A6] text-[#0E0E0E] font-semibold shadow-md'
-                      : 'bg-[#141412] text-[#B8B8B0] hover:bg-[#1E1E1C] hover:text-white border border-[#20201D]'
+                  key={tag.id}
+                  onClick={() => setSelectedTag(tag.id as any)}
+                  className={`px-3 py-1 rounded-full text-[11px] font-medium transition-all cursor-pointer ${
+                    selectedTag === tag.id
+                      ? 'bg-[#8FC1A6] text-[#0E0E0E] font-bold shadow-md'
+                      : 'bg-[#181816] text-[#A6A69F] hover:text-white hover:bg-[#222220] border border-[#242422]'
                   }`}
                 >
-                  <span>{cat.label}</span>
-                  <span
-                    className={`text-[10px] px-1.5 py-0.2 rounded-full ${
-                      active ? 'bg-[#0E0E0E]/20 text-[#0E0E0E] font-bold' : 'bg-[#222220] text-[#7A7A72]'
-                    }`}
-                  >
-                    {cat.count}
-                  </span>
+                  {tag.label}
                 </button>
-              );
-            })}
+              ))}
+            </div>
           </div>
         </div>
       </section>
 
-      {/* Error banner if network down */}
-      {loadError && (
-        <div className="max-w-7xl mx-auto px-4 sm:px-8 mt-4">
-          <div className="bg-amber-950/40 border border-amber-800/50 rounded-2xl p-4 flex items-center justify-between gap-4 text-xs text-amber-200">
-            <div className="flex items-center gap-2.5">
-              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
-              <span>{loadError}</span>
-            </div>
+      {/* Category Pills Navigation */}
+      <section className="sticky top-[58px] sm:top-[65px] z-30 bg-[#0E0E0E]/95 backdrop-blur-md border-b border-[#1C1C1A] py-2.5 px-4 sm:px-8 overflow-x-auto no-scrollbar">
+        <div className="max-w-7xl mx-auto flex items-center gap-2 sm:gap-3 min-w-max">
+          {categories.map((cat) => (
+            <button
+              key={cat.id}
+              onClick={() => setSelectedCategory(cat.id)}
+              className={`px-3.5 sm:px-4 py-1.5 rounded-full text-xs font-medium transition-all whitespace-nowrap cursor-pointer flex items-center gap-2 ${
+                selectedCategory === cat.id
+                  ? 'bg-white text-[#0E0E0E] font-bold shadow-lg'
+                  : 'bg-[#161614] text-[#A6A69F] hover:text-white hover:bg-[#20201D] border border-[#242422]'
+              }`}
+            >
+              <span>{cat.label}</span>
+              <span className={`text-[10px] px-1.5 py-0.2 rounded-full ${
+                selectedCategory === cat.id ? 'bg-[#0E0E0E]/20 text-[#0E0E0E]' : 'bg-[#242422] text-[#888880]'
+              }`}>
+                {cat.count}
+              </span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      {/* Main Catalog Grid */}
+      <main className="max-w-7xl mx-auto px-4 sm:px-8 md:px-12 py-8 sm:py-12">
+        {isLoading ? (
+          <div className="flex flex-col items-center justify-center py-20 space-y-4">
+            <div className="w-10 h-10 border-2 border-[#8FC1A6]/30 border-t-[#8FC1A6] rounded-full animate-spin" />
+            <p className="text-xs text-[#A6A69F] font-light">Chargement de la carte en direct...</p>
+          </div>
+        ) : loadError ? (
+          <div className="max-w-md mx-auto p-6 bg-[#181816] border border-[#2A2A26] rounded-3xl text-center space-y-4">
+            <AlertCircle className="w-8 h-8 text-amber-400 mx-auto" />
+            <p className="text-xs text-[#D4E8DC]">{loadError}</p>
             <button
               onClick={loadMenuData}
-              className="px-3 py-1.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-bold flex items-center gap-1.5 cursor-pointer shrink-0"
+              className="px-5 py-2 rounded-full bg-[#8FC1A6] text-[#0E0E0E] font-bold text-xs hover:bg-[#9ED4B5] transition-all"
             >
-              <RefreshCw className="w-3.5 h-3.5" />
-              <span>Réessayer</span>
+              Réessayer
             </button>
           </div>
-        </div>
-      )}
-
-      {/* Main Grid: Loading Skeleton or Products */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-8 md:px-16 lg:px-24 pt-8">
-        {isLoading ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
-            {[1, 2, 3, 4, 5, 6].map((idx) => (
-              <div
-                key={idx}
-                className="bg-[#141412] rounded-2xl border border-[#20201D] p-4 space-y-4 animate-pulse"
-              >
-                <div className="h-44 bg-[#1A1A18] rounded-xl" />
-                <div className="space-y-2">
-                  <div className="h-4 bg-[#20201D] rounded w-2/3" />
-                  <div className="h-3 bg-[#1B1B19] rounded w-full" />
-                  <div className="h-3 bg-[#1B1B19] rounded w-4/5" />
-                </div>
-                <div className="flex justify-between items-center pt-2">
-                  <div className="h-4 bg-[#20201D] rounded w-16" />
-                  <div className="h-7 bg-[#20201D] rounded-xl w-24" />
-                </div>
-              </div>
-            ))}
-          </div>
         ) : filteredProducts.length === 0 ? (
-          <div className="text-center py-16 bg-[#141412] rounded-3xl border border-[#222220] p-6 max-w-lg mx-auto">
-            <Coffee className="w-10 h-10 text-[#8FC1A6]/50 mx-auto mb-3" />
-            <h3 className="font-serif-display text-xl text-white mb-2">Aucun produit trouvé</h3>
-            <p className="text-xs text-[#888880] mb-5 leading-relaxed">
-              Nous n'avons pas trouvé d'article correspondant à votre recherche.
-            </p>
+          <div className="py-20 text-center space-y-3">
+            <Coffee className="w-10 h-10 text-[#444440] mx-auto" />
+            <p className="text-sm text-[#A6A69F] font-light">Aucun produit ne correspond à votre recherche.</p>
             <button
               onClick={() => {
-                setSearchQuery('');
                 setSelectedCategory('all');
                 setSelectedTag('all');
+                setSearchQuery('');
               }}
-              className="text-xs font-semibold px-4 py-2 rounded-xl bg-[#8FC1A6] text-[#0E0E0E] hover:bg-[#9ED4B5] transition-colors cursor-pointer"
+              className="text-xs text-[#8FC1A6] underline cursor-pointer"
             >
               Réinitialiser les filtres
             </button>
@@ -468,14 +578,16 @@ export const MenuPage: React.FC<MenuPageProps> = ({
                     transition={{ duration: 0.35, delay: Math.min(index * 0.02, 0.25) }}
                     id={`menu-card-${item.id}`}
                     onClick={() => {
-                      if (!isOutOfStock) {
+                      if (!isOutOfStock && isOrderingAllowed) {
                         setCustomizingItem(item);
                       }
                     }}
                     className={`group relative bg-[#141412] rounded-2xl border transition-all duration-300 flex flex-col overflow-hidden text-left ${
                       isOutOfStock
                         ? 'opacity-60 border-[#1E1E1C] cursor-not-allowed'
-                        : 'border-[#20201D] hover:border-[#8FC1A6]/50 cursor-pointer hover:shadow-[0_12px_36px_rgba(0,0,0,0.6)]'
+                        : isOrderingAllowed
+                          ? 'border-[#20201D] hover:border-[#8FC1A6]/50 cursor-pointer hover:shadow-[0_12px_36px_rgba(0,0,0,0.6)]'
+                          : 'border-[#20201D] cursor-default'
                     }`}
                   >
                     {/* Image Header */}
@@ -527,7 +639,7 @@ export const MenuPage: React.FC<MenuPageProps> = ({
                           <span className="text-[10px] uppercase font-bold tracking-[0.2em] text-[#8FC1A6]">
                             {item.category}
                           </span>
-                          {item.parameterGroups && item.parameterGroups.length > 0 && (
+                          {item.parameterGroups && item.parameterGroups.length > 0 && isOrderingAllowed && (
                             <span className="text-[10px] text-[#888880]">
                               Personnalisable
                             </span>
@@ -555,12 +667,18 @@ export const MenuPage: React.FC<MenuPageProps> = ({
                         )}
                       </div>
 
-                      {/* Card Action Row */}
+                      {/* Card Action Row - Gated by isOrderingAllowed (Part A.7) */}
                       <div className="pt-3 border-t border-[#1E1E1C] flex items-center justify-between">
-                        <span className="text-[11px] text-[#8FC1A6] group-hover:text-[#9ED4B5] font-medium flex items-center gap-1 transition-colors">
-                          <span>{isOutOfStock ? 'Indisponible' : 'Sélectionner & Personnaliser'}</span>
-                          <ArrowUpRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
-                        </span>
+                        {isOrderingAllowed ? (
+                          <span className="text-[11px] text-[#8FC1A6] group-hover:text-[#9ED4B5] font-medium flex items-center gap-1 transition-colors">
+                            <span>{isOutOfStock ? 'Indisponible' : 'Sélectionner & Personnaliser'}</span>
+                            <ArrowUpRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
+                          </span>
+                        ) : (
+                          <span className="text-[11px] text-[#666660] font-light italic flex items-center gap-1">
+                            <span>Dégustation sur place</span>
+                          </span>
+                        )}
 
                         <span className="font-serif text-xs sm:text-sm text-white font-medium">
                           {formatDT(item.price)}
@@ -575,9 +693,9 @@ export const MenuPage: React.FC<MenuPageProps> = ({
         )}
       </main>
 
-      {/* Floating Bottom Cart Bar (if items in cart) */}
+      {/* Floating Bottom Cart Bar (Rendered ONLY when ordering is active & cart has items - Part A.7) */}
       <AnimatePresence>
-        {totalCartCount > 0 && (
+        {isOrderingAllowed && totalCartCount > 0 && (
           <motion.div
             initial={{ y: 80, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
@@ -603,25 +721,29 @@ export const MenuPage: React.FC<MenuPageProps> = ({
       </AnimatePresence>
 
       {/* Customization Modal */}
-      <CustomizeModal
-        item={customizingItem as unknown as MenuItem}
-        isOpen={Boolean(customizingItem)}
-        onClose={() => setCustomizingItem(null)}
-        onAddToCart={handleAddToCart}
-      />
+      {isOrderingAllowed && (
+        <CustomizeModal
+          item={customizingItem as unknown as MenuItem}
+          isOpen={Boolean(customizingItem)}
+          onClose={() => setCustomizingItem(null)}
+          onAddToCart={handleAddToCart}
+        />
+      )}
 
-      {/* Cart Drawer */}
-      <CartDrawer
-        isOpen={isCartOpen}
-        onClose={() => setIsCartOpen(false)}
-        cartItems={cartItems}
-        tableNumber={tableNumber}
-        tableToken={tableToken}
-        onUpdateQuantity={handleUpdateQuantity}
-        onRemoveItem={handleRemoveItem}
-        onClearCart={handleClearCart}
-        onOrderSuccess={(orderResp) => setSubmittedOrder(orderResp)}
-      />
+      {/* Cart Drawer (Strictly gated) */}
+      {isOrderingAllowed && (
+        <CartDrawer
+          isOpen={isCartOpen}
+          onClose={() => setIsCartOpen(false)}
+          cartItems={cartItems}
+          tableNumber={tableNumber}
+          tableToken={activeTableToken}
+          onUpdateQuantity={handleUpdateQuantity}
+          onRemoveItem={handleRemoveItem}
+          onClearCart={handleClearCart}
+          onOrderSuccess={(orderResp) => setSubmittedOrder(orderResp)}
+        />
+      )}
 
       {/* Order Success Modal */}
       <OrderSuccessModal

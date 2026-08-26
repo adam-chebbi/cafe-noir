@@ -176,3 +176,25 @@ export interface CoffeeQuizStep {
   }[];
 }
 
+export interface QRSessionInitResponse {
+  valid: boolean;
+  token: string;
+  expiresAt: string;
+  remainingSeconds: number;
+  durationMinutes: number;
+  tableNumber: string;
+  tableId: string;
+  zone?: string;
+  error?: string;
+}
+
+export interface QRSessionValidateResponse {
+  valid: boolean;
+  expiresAt?: string;
+  remainingSeconds?: number;
+  tableNumber?: string;
+  tableId?: string;
+  error?: string;
+}
+
+

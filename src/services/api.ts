@@ -3,7 +3,13 @@
 // Connects website to system (testsys.cafenoir.tn)
 // ==========================================
 
-import { PublicMenuResponse, OrderSubmitPayload, OrderSubmitResponse } from '../types';
+import { 
+  PublicMenuResponse, 
+  OrderSubmitPayload, 
+  OrderSubmitResponse,
+  QRSessionInitResponse,
+  QRSessionValidateResponse
+} from '../types';
 
 export const getApiBaseUrl = (): string => {
   // In Vite, use VITE_API_URL or fallback
@@ -49,6 +55,58 @@ export async function fetchPublicMenu(): Promise<PublicMenuResponse> {
 }
 
 /**
+ * Initialize or bootstrap a QR ordering session for a scanned table
+ */
+export async function initQRSession(
+  tableNumber: string,
+  token?: string
+): Promise<QRSessionInitResponse> {
+  const baseUrl = getApiBaseUrl();
+  const url = `${baseUrl}/api/public/qr-session/init`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify({ tableNumber, token }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || `Erreur d'initialisation de la session QR (${response.status})`);
+  }
+
+  return data as QRSessionInitResponse;
+}
+
+/**
+ * Validate an active QR session against server truth
+ */
+export async function validateQRSession(
+  tableNumber: string,
+  token: string
+): Promise<QRSessionValidateResponse> {
+  const baseUrl = getApiBaseUrl();
+  const url = `${baseUrl}/api/public/qr-session/validate?table=${encodeURIComponent(tableNumber)}&token=${encodeURIComponent(token)}`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    return { valid: false, error: 'Échec de vérification réseau de la session.' };
+  }
+
+  const data = await response.json();
+  return data as QRSessionValidateResponse;
+}
+
+/**
  * Submit Table QR Order to system backend with automatic 1-time retry on network glitch
  */
 export async function submitTableOrder(
@@ -84,3 +142,4 @@ export async function submitTableOrder(
     throw err;
   }
 }
+
